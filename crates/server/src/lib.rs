@@ -9,8 +9,13 @@
 //!   GET /api/info                translation, books, embedder id
 //!   GET /api/chapter/{book}/{n}  verses grouped into sections with summaries
 //!   GET /api/search?q=&limit=&book=   hybrid search (see bt_core::search)
+//!   GET /robots.txt              keeps polite crawlers out of /api
+//!
+//! Abuse protection (rate limits, max concurrent searches) lives in `limits.rs`
+//! and wraps every /api route. Security headers are added to every response.
 
 pub mod assets;
+pub mod limits;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
@@ -23,9 +28,31 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::compression::CompressionLayer;
 
-pub type AppState = Arc<Engine>;
+pub struct App {
+    pub engine: Arc<Engine>,
+    pub limits: limits::Limits,
+}
 
-pub fn router(engine: AppState) -> Router {
+pub type AppState = Arc<App>;
+
+/// The app with production limits.
+pub fn router(engine: Arc<Engine>) -> Router {
+    router_with(engine, &limits::LimitConfig::default())
+}
+
+pub fn router_with(engine: Arc<Engine>, cfg: &limits::LimitConfig) -> Router {
+    let state: AppState = Arc::new(App {
+        engine,
+        limits: limits::Limits::new(cfg),
+    });
+    let api = Router::new()
+        .route("/api/info", get(info))
+        .route("/api/chapter/{book}/{chapter}", get(chapter))
+        .route("/api/search", get(search))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            limits::rate_limit,
+        ));
     Router::new()
         .route("/", get(index))
         .route(
@@ -45,9 +72,16 @@ pub fn router(engine: AppState) -> Router {
             get(|| static_file("image/svg+xml", FAVICON)),
         )
         .route("/healthz", get(|| async { "ok" }))
-        .route("/api/info", get(info))
-        .route("/api/chapter/{book}/{chapter}", get(chapter))
-        .route("/api/search", get(search))
+        .route(
+            "/robots.txt",
+            get(|| {
+                static_file(
+                    "text/plain; charset=utf-8",
+                    "User-agent: *\nDisallow: /api/\n",
+                )
+            }),
+        )
+        .merge(api)
         .fallback(|| async {
             (
                 StatusCode::NOT_FOUND,
@@ -57,7 +91,36 @@ pub fn router(engine: AppState) -> Router {
             )
         })
         .layer(CompressionLayer::new())
-        .with_state(engine)
+        .layer(axum::middleware::map_response(security_headers))
+        .with_state(state)
+}
+
+/// CSP allows only our own scripts plus Google Fonts; inline `style="--c:..."`
+/// attributes are the one inline thing the UI uses.
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; \
+style-src-attr 'unsafe-inline'; font-src https://fonts.gstatic.com; img-src 'self' data:; \
+connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'";
+
+async fn security_headers(mut res: Response) -> Response {
+    let h = res.headers_mut();
+    let set = |h: &mut axum::http::HeaderMap, k: &'static str, v: &'static str| {
+        h.insert(k, axum::http::HeaderValue::from_static(v));
+    };
+    set(h, "content-security-policy", CSP);
+    set(h, "x-content-type-options", "nosniff");
+    set(h, "referrer-policy", "strict-origin-when-cross-origin");
+    set(h, "x-frame-options", "DENY");
+    set(
+        h,
+        "permissions-policy",
+        "camera=(), microphone=(), geolocation=()",
+    );
+    res
+}
+
+/// Echo at most this much user input back in error messages.
+fn clip(s: &str) -> String {
+    s.chars().take(40).collect()
 }
 
 // ---- static UI (compiled in; edit files under web/) ------------------------
@@ -108,7 +171,8 @@ pub struct Info {
     pub books: Vec<BookInfo>,
 }
 
-async fn info(State(e): State<AppState>) -> Json<Info> {
+async fn info(State(app): State<AppState>) -> Json<Info> {
+    let e = &app.engine;
     Json(Info {
         translation: e.bible.translation.clone(),
         embedder: e.embedder_id(),
@@ -159,10 +223,11 @@ pub struct ChapterResponse {
 }
 
 async fn chapter(
-    State(e): State<AppState>,
+    State(app): State<AppState>,
     Path((book, chapter)): Path<(String, u16)>,
 ) -> Response {
-    let b = &e.bible;
+    let b = &app.engine.bible;
+    let book = clip(&book);
     let Some(bi) = b
         .book_index(&book)
         .or_else(|| bt_core::reference::book_from_name(&book))
@@ -235,16 +300,27 @@ pub struct SearchParams {
     pub book: Option<String>,
 }
 
-async fn search(State(e): State<AppState>, Query(p): Query<SearchParams>) -> Response {
+/// Max query length in bytes. The model truncates at 256 tokens anyway.
+pub const MAX_QUERY_BYTES: usize = 300;
+
+async fn search(State(app): State<AppState>, Query(p): Query<SearchParams>) -> Response {
     let q = p.q.unwrap_or_default();
-    if q.len() > 300 {
-        return error(StatusCode::BAD_REQUEST, "query too long (max 300 chars)");
+    if q.len() > MAX_QUERY_BYTES {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("query too long (max {MAX_QUERY_BYTES} chars)"),
+        );
     }
     let book = match p.book.as_deref().filter(|s| !s.is_empty()) {
         None => None,
-        Some(id) => match e.bible.book_index(id) {
+        Some(id) => match app.engine.bible.book_index(id) {
             Some(i) => Some(i),
-            None => return error(StatusCode::BAD_REQUEST, format!("unknown book {id}")),
+            None => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown book {}", clip(id)),
+                );
+            }
         },
     };
     let opts = SearchOptions {
@@ -252,14 +328,43 @@ async fn search(State(e): State<AppState>, Query(p): Query<SearchParams>) -> Res
         section_limit: 5,
         book,
     };
-    // Embedding the query is CPU work (a few ms); keep it off the async workers.
-    let engine = e.clone();
-    match tokio::task::spawn_blocking(move || engine.search(&q, &opts)).await {
+    // At most `max_concurrent_searches` model runs at once; others queue briefly, then 503.
+    let permit = match tokio::time::timeout(
+        app.limits.queue_wait,
+        app.limits.inference.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        _ => {
+            tracing::warn!("search queue full");
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Busy right now, try again in a moment.",
+            );
+        }
+    };
+    // Embedding the query is CPU work (~25 ms); keep it off the async workers.
+    let engine = app.engine.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        engine.search(&q, &opts)
+    })
+    .await;
+    match res {
         Ok(Ok(r)) => {
-            tracing::info!(query = %r.query, ms = r.took_ms, hits = r.verses.len(), "search");
+            // Debug formatting escapes newlines/control chars (no log injection).
+            let shown: String = r.query.chars().take(80).collect();
+            tracing::info!(query = ?shown, ms = r.took_ms, hits = r.verses.len(), "search");
             Json(r).into_response()
         }
-        Ok(Err(err)) => error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Ok(Err(err)) => {
+            tracing::error!("search failed: {err:#}");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "search failed")
+        }
+        Err(err) => {
+            tracing::error!("search task panicked: {err}");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "search failed")
+        }
     }
 }

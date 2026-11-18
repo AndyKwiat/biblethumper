@@ -6,7 +6,7 @@ Read this before changing anything. `CLAUDE.md` points here.
 
 A Rust web app to search and read the four Gospels (KJV) with a plain-English
 "Coles Notes" column beside every passage. Deployed with radify at
-https://biblethumper.akwiat.com (allowlisted to Andy).
+https://biblethumper.akwiat.com (public, no login).
 
 ## Map
 
@@ -26,6 +26,7 @@ crates/core/             bt-core library, no HTTP
 crates/server/           bt-server: axum app
   src/lib.rs             router() + all handlers (routes listed at top of file)
   src/assets.rs          finds assets/, loads model + embeddings (rebuilds if stale)
+  src/limits.rs          rate limits (per-IP + global token buckets) + max concurrent searches
   src/main.rs            binary `app` (radify entry point)
   src/bin/bt.rs          CLI `bt`: build-index | check-index | quantize | search | bench
   tests/api.rs           HTTP tests, in-process, HashEmbedder (no model needed)
@@ -96,6 +97,21 @@ route list in the module doc current), test in `tests/api.rs`.
 
 **Change the UI.** Edit `web/*`; pure logic goes in `lib.js` with a test in
 `lib.test.js`. Rebuild the binary (files are compiled in).
+
+## Security / abuse protection
+
+The app is public. `limits.rs` (defaults in `LimitConfig::default`):
+- per client IP: 30 searches burst, +30/min; other /api routes 120 burst, +300/min -> 429 + Retry-After
+- global: 100 searches burst, +20/s across all clients -> 429
+- at most 2 searches run the model at once; others wait up to 3 s -> 503
+- client IP = `CF-Connecting-IP` (Cloudflare -> Caddy -> app), else last `X-Forwarded-For`, else peer.
+  IPv6 grouped per /64. Header spoofing can only dodge the per-IP bucket, not the global caps.
+- queries capped at 300 bytes (model truncates at 256 tokens); error messages echo <= 40 chars;
+  query logs use Debug formatting (no log injection); internal errors are not returned to clients.
+- CSP/nosniff/frame headers on every response (`security_headers` in lib.rs). The UI must not use
+  inline <script>/<style> blocks (inline `style=` attributes are allowed).
+- Load-tested: 600 unique queries, 100 concurrent, 300 IPs -> stays up at ~120 MB RSS.
+Tests for all of this are at the bottom of `tests/api.rs` and in `limits.rs`.
 
 ## Gotchas
 

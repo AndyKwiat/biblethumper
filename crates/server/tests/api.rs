@@ -210,3 +210,170 @@ async fn responses_are_gzipped_when_asked() {
     let res = router(engine()).oneshot(req).await.unwrap();
     assert_eq!(res.headers().get("content-encoding").unwrap(), "gzip");
 }
+
+// ---- abuse protection + security headers -------------------------------------
+
+use bt_server::limits::LimitConfig;
+use bt_server::router_with;
+use std::time::Duration;
+
+async fn status_from(
+    app: &axum::Router,
+    uri: &str,
+    ip: &str,
+) -> (StatusCode, axum::http::HeaderMap) {
+    let req = Request::get(uri)
+        .header("cf-connecting-ip", ip)
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    (res.status(), res.headers().clone())
+}
+
+fn tight() -> LimitConfig {
+    LimitConfig {
+        search_burst: 3.0,
+        search_per_min: 1.0,
+        api_burst: 5.0,
+        api_per_min: 1.0,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn search_is_rate_limited_per_client() {
+    let app = router_with(engine(), &tight());
+    for _ in 0..3 {
+        assert_eq!(
+            status_from(&app, "/api/search?q=love", "1.1.1.1").await.0,
+            StatusCode::OK
+        );
+    }
+    let (s, h) = status_from(&app, "/api/search?q=love", "1.1.1.1").await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        h.get("retry-after")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            >= 1
+    );
+    // a different client is unaffected
+    assert_eq!(
+        status_from(&app, "/api/search?q=love", "2.2.2.2").await.0,
+        StatusCode::OK
+    );
+    // static files and health checks are never limited
+    for _ in 0..10 {
+        assert_eq!(status_from(&app, "/", "1.1.1.1").await.0, StatusCode::OK);
+        assert_eq!(
+            status_from(&app, "/healthz", "1.1.1.1").await.0,
+            StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test]
+async fn other_api_routes_have_their_own_limit() {
+    let app = router_with(engine(), &tight());
+    for _ in 0..5 {
+        assert_eq!(
+            status_from(&app, "/api/chapter/MAT/1", "3.3.3.3").await.0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        status_from(&app, "/api/info", "3.3.3.3").await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn global_search_budget_applies_across_clients() {
+    let cfg = LimitConfig {
+        global_search_burst: 4.0,
+        global_search_per_sec: 0.01,
+        ..Default::default()
+    };
+    let app = router_with(engine(), &cfg);
+    for i in 0..4 {
+        assert_eq!(
+            status_from(&app, "/api/search?q=love", &format!("10.0.0.{i}"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        status_from(&app, "/api/search?q=love", "10.0.0.99").await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn search_returns_503_when_model_slots_are_busy() {
+    let cfg = LimitConfig {
+        max_concurrent_searches: 0,
+        queue_wait: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let app = router_with(engine(), &cfg);
+    let (s, _) = status_from(&app, "/api/search?q=love", "4.4.4.4").await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn security_headers_on_every_response() {
+    for uri in ["/", "/app.js", "/api/info", "/api/search?q=x", "/nope"] {
+        let res = router(engine())
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let h = res.headers();
+        let csp = h.get("content-security-policy").unwrap().to_str().unwrap();
+        assert!(
+            csp.contains("script-src 'self'") && csp.contains("frame-ancestors 'none'"),
+            "{uri}"
+        );
+        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
+    }
+}
+
+#[tokio::test]
+async fn robots_txt_disallows_api() {
+    let (s, ct, b) = get("/robots.txt").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(ct.starts_with("text/plain"));
+    assert!(String::from_utf8(b).unwrap().contains("Disallow: /api/"));
+}
+
+#[tokio::test]
+async fn error_messages_do_not_echo_long_input() {
+    let long = "x".repeat(250);
+    let (s, e): (_, ErrorBody) = get_json(&format!("/api/chapter/{long}/1")).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(e.error.len() < 80, "{}", e.error);
+}
+
+#[tokio::test]
+async fn hostile_queries_are_handled() {
+    for q in [
+        "%00%01%02",
+        "%0Afake%20log%20line",
+        "%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+        "%F0%9F%98%80%F0%9F%98%80",
+        "'%20OR%201%3D1--",
+        "...",
+        "-",
+        "john%2099999999999:1",
+    ] {
+        let (s, _, _) = get(&format!("/api/search?q={q}")).await;
+        assert_eq!(s, StatusCode::OK, "{q}");
+    }
+    // exactly at the limit is fine; one more byte is rejected
+    let (s, _, _) = get(&format!("/api/search?q={}", "a".repeat(300))).await;
+    assert_eq!(s, StatusCode::OK);
+}

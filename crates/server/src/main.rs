@@ -23,6 +23,9 @@ async fn main() -> anyhow::Result<()> {
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
     tracing::info!("listening on http://{host}:{port}");
-    axum::serve(listener, bt_server::router(Arc::new(engine))).await?;
+    // ConnectInfo gives the rate limiter the peer address when no proxy headers exist.
+    let app = bt_server::router(Arc::new(engine))
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    axum::serve(listener, app).await?;
     Ok(())
 }

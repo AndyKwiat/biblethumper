@@ -12,7 +12,7 @@ plain-English note beside every passage.
 - **Fast and small.** Rust (axum) server, one static binary. Hybrid search =
   BM25 keywords + all-MiniLM-L6-v2 sentence embeddings (run on CPU with candle),
   fused with reciprocal-rank fusion. ~25 ms for a new query, ~2 ms cached,
-  ~110 MB RAM, 0.4 s startup.
+  ~110 MB RAM, 0.4 s startup. Rate-limited so bots can't swamp the model.
 
 Live: https://biblethumper.akwiat.com
 
