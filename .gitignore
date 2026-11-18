@@ -1,0 +1,4 @@
+/target
+/dist
+# Model weights + embeddings are downloaded/generated (scripts/fetch_model.sh, bt build-index)
+/assets
