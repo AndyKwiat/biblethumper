@@ -45,3 +45,7 @@ Developer and agent guide (layout, tests, how-tos): [AGENTS.md](AGENTS.md).
 - KJV text: eBible.org `eng-kjv_usfm` (public domain), imported by `tools/import_kjv.py`.
 - Embedding model: sentence-transformers/all-MiniLM-L6-v2 (Apache-2.0).
 - Passage titles and summaries: written by Claude from the KJV text; not scripture.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Covers the code only: the KJV text is public domain and the MiniLM model is Apache-2.0.
